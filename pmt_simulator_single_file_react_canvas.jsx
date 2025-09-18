@@ -168,6 +168,31 @@ function makeSyncedVisuals(tEvent, y, vph, velE, xStartP, targetX) {
   };
 }
 
+function getPairState(pair, now, geom) {
+  const agePhoton = now - pair.photon.t0;
+  const ageElectron = now - pair.electron.t0;
+
+  const photonX = geom.xStartP + pair.photon.v * agePhoton;
+  const electronX = geom.xStartE + pair.electron.v * ageElectron;
+
+  const photonActive = agePhoton < 0 || photonX < geom.targetX;
+  const electronActive = ageElectron < 0 || electronX < geom.xEndAnode;
+
+  const photonDraw = agePhoton >= 0 && photonX < geom.targetX;
+  const electronDraw = ageElectron >= 0 && electronX < geom.xEndAnode;
+
+  return {
+    agePhoton,
+    ageElectron,
+    photonX,
+    electronX,
+    photonActive,
+    electronActive,
+    photonDraw,
+    electronDraw,
+  };
+}
+
 function pulseShape(t, t0, A, tauRise, tauFall) {
   if (t <= t0) return 0;
   const x = (t - t0);
@@ -415,13 +440,9 @@ export default function PMTSimulator() {
   const sampleIntervalRef = useRef(1 / 240);
   const nextSampleTimeRef = useRef(0);
   const samplesRef = useRef([]);
-  const photonsRef = useRef([]);
-  const electronsRef = useRef([]);
   const pairsRef = useRef([]);
   const arrivalsDetRef = useRef([]);
   const arrivalsDarkRef = useRef([]);
-
-  const nextPhotonVisRef = useRef(null);
 
   // Event-driven IIR states (unnormalized double-exp states)
   const sRiseRef = useRef(0);
@@ -474,6 +495,20 @@ export default function PMTSimulator() {
       const pcX = xLeft + radius * 0.95;
       const targetX = pcX;
       const xEndAnode = xLeft + tubeLen - radius * 0.95;
+      const xStartP = xLeft - 20;
+      const xStartE = targetX + 2;
+
+      const geom = { W, H, beamY, radius, tubeLen, xLeft, pcX, targetX, xEndAnode, xStartP, xStartE };
+
+      if (pairsRef.current.length) {
+        const activePairs = [];
+        for (let i = 0; i < pairsRef.current.length; i++) {
+          const pair = pairsRef.current[i];
+          const state = getPairState(pair, tRef.current, geom);
+          if (state.photonActive || state.electronActive) activePairs.push(pair);
+        }
+        pairsRef.current = activePairs;
+      }
 
       // Rates
       const photonSpeed = W * 0.6; // px/s
@@ -486,63 +521,55 @@ export default function PMTSimulator() {
       const visCaps = getVisualCaps(electronRate, p.flux, dpr); // dynamic caps by rate & DPR
       const pairsCap = Math.min(visCaps.photons, visCaps.electrons);
 
+      const safePairsCap = Number.isFinite(pairsCap) ? pairsCap : 0;
+      pairsRef.current = thinArray(pairsRef.current, safePairsCap);
+
       // --- Visuals --- (defined as a function so we can render after spawning events this frame)
       const renderVisuals = () => {
         const pmtCanvas = pmtCanvasRef.current;
         if (!pmtCanvas) return;
         const ctx = pmtCanvas.getContext("2d");
         const dpr = window.devicePixelRatio || 1;
-        const W = pmtCanvas.width / dpr, H = pmtCanvas.height / dpr;
-        const beamY = H * 0.5;
-        const radius = Math.min(H * 0.22, W * 0.10);
-        const tubeLen = Math.min(W * 0.75, W - 40);
-        const xLeft = (W - tubeLen) / 2;
-        const pcX = xLeft + radius * 0.95;
-        const targetX = pcX;
-        const xEndAnode = xLeft + tubeLen - radius * 0.95;
+        const {
+          W: geomW,
+          H: geomH,
+          beamY: geomBeamY,
+          targetX: geomTargetX,
+          xEndAnode: geomXEndAnode,
+          xStartP: geomXStartP,
+          xStartE: geomXStartE,
+        } = geom;
 
-        ctx.save(); ctx.scale(dpr, dpr); ctx.clearRect(0, 0, W, H);
-        drawPMT(ctx, W, H);
+        ctx.save(); ctx.scale(dpr, dpr); ctx.clearRect(0, 0, geomW, geomH);
+        drawPMT(ctx, geomW, geomH);
 
         // Blurs (guarded; heavy filters disabled on high-DPR or extreme flux)
         const enableBlur = electronRate > 1e3 && dpr <= 1.5;
         if (enableBlur) {
-          const xStart = xLeft - 20;
-          const xEnd = targetX - 4;
+          const xEnd = geomTargetX - 4;
           const intensity = Math.min(1, Math.max(0, (Math.log10(Math.max(1, p.flux)) - 3) / 4)); // 1e3..1e7 -> 0..1
-          drawFluxBlur(ctx, xStart, xEnd, beamY, Math.max(4, H * 0.14), intensity);
+          drawFluxBlur(ctx, geomXStartP, xEnd, geomBeamY, Math.max(4, geomH * 0.14), intensity);
         }
 
         if (enableBlur && electronRate > 1e3) {
-          const xStartEl = targetX + 2; const xEndEl = xEndAnode;
+          const xEndEl = geomXEndAnode;
           const intensityE = Math.min(1, Math.max(0, (Math.log10(Math.max(1, electronRate)) - 3) / 4));
-          drawElectronBlur(ctx, xStartEl, xEndEl, beamY, Math.max(3, H * 0.12), intensityE);
+          drawElectronBlur(ctx, geomXStartE, xEndEl, geomBeamY, Math.max(3, geomH * 0.12), intensityE);
         }
 
         // Draw & cull synchronized photon/electron pairs (analytic positions)
-        const xStartP = xLeft - 20;
-        const xStartE = targetX + 2;
-        const keepPairs = [];
         for (let i = 0; i < pairsRef.current.length; i++) {
           const pair = pairsRef.current[i];
-          // photon
-          const agePh = tRef.current - pair.ph.t0;
-          if (agePh >= 0) {
-            const xPh = xStartP + pair.ph.v * agePh;
-            if (xPh < targetX) drawPhoton(ctx, { x: xPh, y: pair.ph.y });
+          const state = getPairState(pair, tRef.current, geom);
+
+          if (state.photonDraw) {
+            drawPhoton(ctx, { x: state.photonX, y: pair.photon.y });
           }
-          // electron
-          const ageEl = tRef.current - pair.el.t0;
-          if (ageEl >= 0) {
-            const xEl = xStartE + pair.el.v * ageEl;
-            if (xEl < xEndAnode) drawElectron(ctx, { x: xEl, y: pair.el.y });
+
+          if (state.electronDraw) {
+            drawElectron(ctx, { x: state.electronX, y: pair.electron.y });
           }
-          // keep while either is pending or still inside tube
-          const phVisible = agePh < 0 || (agePh >= 0 && (xStartP + pair.ph.v * agePh) < targetX);
-          const elVisible = ageEl < 0 || (ageEl >= 0 && (xStartE + pair.el.v * ageEl) < xEndAnode);
-          if (phVisible || elVisible) keepPairs.push(pair);
         }
-        pairsRef.current = thinArray(keepPairs, Math.min(visCaps.photons, visCaps.electrons));
         ctx.restore();
       };
 
@@ -575,9 +602,8 @@ export default function PMTSimulator() {
           });
 
           // visuals: spawn synchronized photon/electron pairs tied to emission time (detections only)
-          if (type === 'det' && pairsCap > 0) {
-            const xStartP = xLeft - 20;
-            const budget = Math.max(0, pairsCap - pairsRef.current.length);
+          if (type === 'det' && safePairsCap > 0) {
+            const budget = Math.max(0, safePairsCap - pairsRef.current.length);
             const nVis = Math.min(k, budget);
             for (let i = 0; i < nVis; i++) {
               const u = Math.random();
@@ -585,9 +611,8 @@ export default function PMTSimulator() {
               const y = beamY + (Math.random() - 0.5) * (H * 0.2);
               const vph = photonSpeed * (0.8 + 0.4 * Math.random());
               const velE = electronSpeed; // fixed to match IIR transit time so the hit at the anode lines up
-              const tPhotonStart = photonLaunchTime(tEvent, vph, xStartP, targetX);
               // Photon hits the photocathode at tEvent, electron starts at tEvent and reaches anode exactly at tEvent + electronTransitTime
-              pairsRef.current.push({ ph: { t0: tPhotonStart, y, v: vph }, el: { t0: tEvent, y, v: velE } });
+              pairsRef.current.push(makeSyncedVisuals(tEvent, y, vph, velE, xStartP, targetX));
             }
           }
         }
@@ -687,15 +712,12 @@ export default function PMTSimulator() {
 
   const reset = () => {
     samplesRef.current = [];
-    photonsRef.current = [];
-    electronsRef.current = [];
     arrivalsDetRef.current = [];
     arrivalsDarkRef.current = [];
     sRiseRef.current = 0; sFallRef.current = 0;
     tRef.current = 0; nextSampleTimeRef.current = 0; lastTsRef.current = null;
     ttlActiveUntilRef.current = 0; nextTriggerReadyRef.current = 0;
     lastSampleVRef.current = 0; lastSampleTRef.current = 0;
-    nextPhotonVisRef.current = null;
     pairsRef.current = []; // reset pairs when clearing scheduler
   };
 
@@ -858,8 +880,8 @@ function runSelfTests() {
 
   // makeSyncedVisuals produces a pair where the photon reaches PC exactly at electron start time
   const pair = makeSyncedVisuals(2.0, 0, 150, 200, 10, 70); // distance=60px, vph=150 -> 0.4s lead
-  console.assert(Math.abs((pair.el.t0 - pair.ph.t0) - ((70 - 10) / 150)) < 1e-9, "makeSyncedVisuals photon timing wrong");
-  console.assert(pair.el.t0 === 2.0, "makeSyncedVisuals electron start mismatch");
+  console.assert(Math.abs((pair.electron.t0 - pair.photon.t0) - ((70 - 10) / 150)) < 1e-9, "makeSyncedVisuals photon timing wrong");
+  console.assert(pair.electron.t0 === 2.0, "makeSyncedVisuals electron start mismatch");
 
   // End-to-end geometry timing: photon at PC at tEvt, electron reaches anode at tEvt + transit
   (function testEndToEndSync(){
@@ -873,7 +895,7 @@ function runSelfTests() {
     const vph2 = W * 0.6, vEl2 = W * 1.2;
     const tEvt2 = 2.4;
     const p2 = makeSyncedVisuals(tEvt2, 0, vph2, vEl2, xStartP2, targetX);
-    const photonXatEvt = xStartP2 + vph2 * (tEvt2 - p2.ph.t0);
+    const photonXatEvt = xStartP2 + vph2 * (tEvt2 - p2.photon.t0);
     console.assert(Math.abs(photonXatEvt - targetX) < 1e-6, "Photon not at photocathode at event (sync)");
     const transit = Math.max(0, (xEndAnode - (targetX + 2)) / vEl2);
     const elXAtAnode = (targetX + 2) + vEl2 * transit;
